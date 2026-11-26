@@ -50,13 +50,17 @@ _dnshe_mutate() {
   esac
 
   _dnshe_zone || return 1
-  _dnshe_ids="$(_dnshe_request dns_records list "&subdomain_id=$_dnshe_zone_id" '' records)" || return 1
+  _dnshe_ids="$(_dnshe_list_matching_records)" || return 1
   if [ "$1" = add ]; then
     _saveaccountconf_mutable DNSHE_API_KEY "$DNSHE_API_KEY" 1
     _saveaccountconf_mutable DNSHE_API_SECRET "$DNSHE_API_SECRET" 1
     if [ -z "$_dnshe_ids" ]; then
       _dnshe_body="{\"subdomain_id\":$_dnshe_zone_id,\"type\":\"TXT\",\"name\":\"$_dnshe_relative\",\"content\":\"$_dnshe_value\"}"
-      _dnshe_request dns_records create '' "$_dnshe_body" write || return 1
+      if ! _dnshe_request dns_records create '' "$_dnshe_body" write; then
+        # A lost response can follow a successful create. Check without replaying the POST.
+        _dnshe_ids="$(_dnshe_list_matching_records)" || return 1
+        [ -n "$_dnshe_ids" ] || return 1
+      fi
     fi
     return 0
   fi
@@ -66,6 +70,10 @@ _dnshe_mutate() {
     _dnshe_request dns_records delete '' "{\"id\":$_dnshe_id}" write || _dnshe_failed=1
   done
   return "$_dnshe_failed"
+}
+
+_dnshe_list_matching_records() {
+  _dnshe_request dns_records list "&subdomain_id=$_dnshe_zone_id" '' records
 }
 
 _dnshe_zone() {
@@ -108,6 +116,22 @@ _dnshe_request() (
   ACME_HTTP_NO_REDIRECTS=1
   HTTP_HEADER="$(_mktemp)" || return 1
   trap 'rm -f -- "$HTTP_HEADER"' EXIT
+  _inithttp
+  if [ -n "$_ACME_CURL" ] && [ "${ACME_USE_WGET:-0}" = 0 ]; then
+    # --disable must be the first option to keep curlrc redirects, retries and traces out.
+    _ACME_CURL="curl --disable ${_ACME_CURL#curl } --connect-timeout 10 --max-time 30"
+  elif [ -n "$_ACME_WGET" ]; then
+    _dnshe_wget_help="$(wget --help 2>&1)"
+    if _contains "$_dnshe_wget_help" '-T'; then
+      _ACME_WGET="$_ACME_WGET -T 30"
+    fi
+    if _contains "$_dnshe_wget_help" '--tries'; then
+      _ACME_WGET="$_ACME_WGET --tries=1"
+    fi
+    if _contains "$_dnshe_wget_help" '--no-config'; then
+      _ACME_WGET="$_ACME_WGET --no-config"
+    fi
+  fi
   export _H1="X-API-Key: $DNSHE_API_KEY"
   export _H2="X-API-Secret: $DNSHE_API_SECRET"
   export _H3="Accept: application/json"
@@ -117,7 +141,7 @@ _dnshe_request() (
   if [ -n "$4" ]; then
     _dnshe_response="$(_post "$4" "$_dnshe_url" '' POST application/json)" || _dnshe_transport=$?
   else
-    _dnshe_response="$(_get "$_dnshe_url" '' 30)" || _dnshe_transport=$?
+    _dnshe_response="$(_get "$_dnshe_url")" || _dnshe_transport=$?
   fi
   _dnshe_http_status="$(sed -n 's/^[[:space:]]*HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p' "$HTTP_HEADER" | _tail_n 1)"
   _dnshe_parsed="$(printf '%s' "$_dnshe_response" | _dnshe_json "$5")" || _dnshe_parsed=invalid_json
@@ -138,7 +162,7 @@ _dnshe_request() (
 # Read only the documented top-level fields and row fields. JSON strings are
 # tokenized before interpreting punctuation, including unrelated record values.
 _dnshe_json() {
-  awk -v mode="$1" -v name="$_dnshe_name" -v relative="${_dnshe_relative:-}" -v value="$_dnshe_value" '
+  awk -v mode="$1" -v name="$_dnshe_name" -v zone="${_dnshe_zone:-}" -v value="$_dnshe_value" '
     { input = input $0 "\n" }
     function next_token(    length_used, ch) {
       sub(/^[[:space:]]+/, "", input)
@@ -207,16 +231,19 @@ _dnshe_json() {
       }
       next_token()
     }
-    function collect(    domain, prefix_len, id, status, record_name) {
+    function inside_zone(name, domain,    prefix_len) {
+      prefix_len = length(name) - length(domain)
+      return name == domain || (prefix_len > 0 && substr(name, prefix_len) == "." domain)
+    }
+    function collect(    domain, id, status, record_name, absolute) {
       rows++
       id = row["id"]
       sub(/^0+/, "", id)
       if (mode == "zones") {
         domain = tolower(row["full_domain"])
         sub(/\.+$/, "", domain)
-        prefix_len = length(name) - length(domain)
         if (domain !~ /^[a-z0-9.-]+$/ || length(domain) <= length(best)) return
-        if (name != domain && (prefix_len < 1 || substr(name, prefix_len) != "." domain)) return
+        if (!inside_zone(name, domain)) return
         best = domain
         best_id = id
         status = tolower(row["status"])
@@ -225,9 +252,10 @@ _dnshe_json() {
       } else {
         if (!("name" in row) || !("content" in row)) return
         record_name = tolower(row["name"])
-        sub(/\.+$/, "", record_name)
-        if (record_name == "" && relative == "@") record_name = "@"
-        if (tolower(row["type"]) != "txt" || (record_name != name && record_name != relative)) return
+        absolute = sub(/\.+$/, "", record_name)
+        if (!absolute && (record_name == "" || record_name == "@")) record_name = zone
+        else if (!absolute && !inside_zone(record_name, zone)) record_name = record_name "." zone
+        if (tolower(row["type"]) != "txt" || record_name != name) return
         if (row["content"] != value && row["content"] != "\\\"" value "\\\"") return
         if (id !~ /^[1-9][0-9]*$/) exit 1
         ids[id] = 1

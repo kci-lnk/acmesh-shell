@@ -24,6 +24,12 @@ assert_request() {
   'https://api005.dnshe.com/index.php?m=domain_hub&endpoint='*) ;;
   *) exit 2 ;;
   esac
+  if [ "${ACME_USE_WGET:-0}" = 0 ] && _exists curl; then
+    case "$_ACME_CURL" in
+    'curl --disable '*" --connect-timeout 10 --max-time 30") ;;
+    *) exit 2 ;;
+    esac
+  fi
 }
 
 _get() {
@@ -58,6 +64,10 @@ _get() {
       printf '%s\n' '{"success":true,"records":[]}'
       return
     fi
+    if [ "${test_case:-}" = lost-create ] && grep -q 'lost-token' "$test_writes"; then
+      printf '%s\n' '{"success":true,"records":[{"id":345678901234567,"name":"_acme-challenge.nested.example.net","type":"TXT","content":"lost-token"}]}'
+      return
+    fi
     cat <<'JSON'
 {
   "success": true,
@@ -66,7 +76,8 @@ _get() {
     {"id": 4, "name":"_acme-challenge.nested.example.net.", "type":"TXT", "content":"extra-token"},
     {"id": 6, "name":"_acme-challenge", "type":"A", "content":"root-token"},
     {"id": 7, "name":"wrong", "type":"TXT", "content":"root-token"},
-    {"id": 8, "name":"wrong", "type":"TXT", "content":"punctuation: \"}],{\", \\ and unicode \u1234"}
+    {"id": 8, "name":"wrong", "type":"TXT", "content":"punctuation: \"}],{\", \\ and unicode \u1234"},
+    {"id": 9, "name":"_acme-challenge.", "type":"TXT", "content":"outside-token"}
   ]
 }
 JSON
@@ -81,6 +92,11 @@ _post() {
   printf '%s\n' "$1" >>"$test_writes"
   case "$2" in
   *'endpoint=dns_records&action=create')
+    if [ "${test_case:-}" = lost-create ]; then
+      printf 'HTTP/2 502\r\n' >"$HTTP_HEADER"
+      printf '%s\n' 'upstream response lost'
+      return 1
+    fi
     printf 'HTTP/2 201\r\n' >"$HTTP_HEADER"
     printf '%s\n' '{"success":true,"id":345678901234567}'
     ;;
@@ -109,9 +125,13 @@ run_hook dns_dnshe_add "$test_name" wildcard-token
 unset DNSHE_API_KEY DNSHE_API_SECRET
 run_hook dns_dnshe_rm "$test_name" root-token
 test_case=no-matches run_hook dns_dnshe_rm "$test_name" root-token
+run_hook dns_dnshe_rm "$test_name.nested.example.net" extra-token
+run_hook dns_dnshe_rm "$test_name" outside-token
+test_case=lost-create run_hook dns_dnshe_add "$test_name" lost-token >"$test_dir/output" 2>&1
 cat >"$test_dir/expected" <<'JSON'
 {"subdomain_id":123456789012345,"type":"TXT","name":"_acme-challenge","content":"wildcard-token"}
 {"id":234567890123456}
+{"subdomain_id":123456789012345,"type":"TXT","name":"_acme-challenge","content":"lost-token"}
 JSON
 diff -u "$test_dir/expected" "$test_writes"
 
